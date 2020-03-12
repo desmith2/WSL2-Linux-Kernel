@@ -731,11 +731,11 @@ static unsigned long pit_hpet_ptimer_calibrate_cpu(void)
 		 * calibration, which will take at least 50ms, and
 		 * read the end value.
 		 */
-		local_irq_save(flags);
+		flags = hard_local_irq_save();
 		tsc1 = tsc_read_refs(&ref1, hpet);
 		tsc_pit_khz = pit_calibrate_tsc(latch, ms, loopmin);
 		tsc2 = tsc_read_refs(&ref2, hpet);
-		local_irq_restore(flags);
+		hard_local_irq_restore(flags);
 
 		/* Pick the lowest PIT TSC calibration so far */
 		tsc_pit_min = min(tsc_pit_min, tsc_pit_khz);
@@ -844,9 +844,9 @@ unsigned long native_calibrate_cpu_early(void)
 	if (!fast_calibrate)
 		fast_calibrate = cpu_khz_from_msr();
 	if (!fast_calibrate) {
-		local_irq_save(flags);
+		flags = hard_local_irq_save();
 		fast_calibrate = quick_pit_calibrate();
-		local_irq_restore(flags);
+		hard_local_irq_restore(flags);
 	}
 	return fast_calibrate;
 }
@@ -1109,7 +1109,7 @@ static struct clocksource clocksource_tsc_early = {
  * this one will immediately take over. We will only register if TSC has
  * been found good.
  */
-static struct clocksource clocksource_tsc = {
+struct clocksource clocksource_tsc = {
 	.name                   = "tsc",
 	.rating                 = 300,
 	.read                   = read_tsc,

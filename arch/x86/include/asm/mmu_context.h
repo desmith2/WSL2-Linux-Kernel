@@ -27,16 +27,16 @@ static inline void paravirt_activate_mm(struct mm_struct *prev,
 
 DECLARE_STATIC_KEY_FALSE(rdpmc_always_available_key);
 
-static inline void load_mm_cr4(struct mm_struct *mm)
+static inline void load_mm_cr4_irqsoff(struct mm_struct *mm)
 {
 	if (static_branch_unlikely(&rdpmc_always_available_key) ||
 	    atomic_read(&mm->context.perf_rdpmc_allowed))
-		cr4_set_bits(X86_CR4_PCE);
+		cr4_set_bits_irqsoff(X86_CR4_PCE);
 	else
-		cr4_clear_bits(X86_CR4_PCE);
+		cr4_clear_bits_irqsoff(X86_CR4_PCE);
 }
 #else
-static inline void load_mm_cr4(struct mm_struct *mm) {}
+static inline void load_mm_cr4_irqsoff(struct mm_struct *mm) {}
 #endif
 
 #ifdef CONFIG_MODIFY_LDT_SYSCALL
@@ -173,7 +173,8 @@ static inline void switch_ldt(struct mm_struct *prev, struct mm_struct *next)
 		load_mm_ldt(next);
 #endif
 
-	DEBUG_LOCKS_WARN_ON(preemptible());
+	DEBUG_LOCKS_WARN_ON(preemptible() &&
+			(!IS_ENABLED(CONFIG_IPIPE) || !hard_irqs_disabled()));
 }
 
 void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk);
@@ -212,6 +213,9 @@ extern void switch_mm(struct mm_struct *prev, struct mm_struct *next,
 extern void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 			       struct task_struct *tsk);
 #define switch_mm_irqs_off switch_mm_irqs_off
+
+#define ipipe_switch_mm_head(prev, next, tsk) \
+	switch_mm_irqs_off(prev, next, tsk)
 
 #define activate_mm(prev, next)			\
 do {						\
