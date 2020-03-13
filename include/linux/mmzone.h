@@ -18,8 +18,6 @@
 #include <linux/pageblock-flags.h>
 #include <linux/page-flags-layout.h>
 #include <linux/atomic.h>
-#include <linux/mm_types.h>
-#include <linux/page-flags.h>
 #include <asm/page.h>
 
 /* Free memory management - zoned buddy allocator.  */
@@ -99,18 +97,6 @@ struct free_area {
 	struct list_head	free_list[MIGRATE_TYPES];
 	unsigned long		nr_free;
 };
-
-static inline struct page *get_page_from_free_area(struct free_area *area,
-					    int migratetype)
-{
-	return list_first_entry_or_null(&area->free_list[migratetype],
-					struct page, lru);
-}
-
-static inline bool free_area_empty(struct free_area *area, int migratetype)
-{
-	return list_empty(&area->free_list[migratetype]);
-}
 
 struct pglist_data;
 
@@ -467,14 +453,6 @@ struct zone {
 	seqlock_t		span_seqlock;
 #endif
 
-#ifdef CONFIG_PAGE_REPORTING
-	/*
-	 * Pointer to reported page tracking statistics array. The size of
-	 * the array is MAX_ORDER - PAGE_REPORTING_MIN_ORDER. NULL when
-	 * unused page reporting is not present.
-	 */
-	unsigned long		*reported_pages;
-#endif
 	int initialized;
 
 	/* Write-intensive fields used from the page allocator */
@@ -542,17 +520,6 @@ enum pgdat_flags {
 					 * many pages under writeback
 					 */
 	PGDAT_RECLAIM_LOCKED,		/* prevents concurrent reclaim */
-};
-
-enum zone_flags {
-	ZONE_PAGE_REPORTING_ACTIVE,	/* zone enabled page reporting and is
-					 * activly flushing the data out of
-					 * higher order pages.
-					 */
-	ZONE_PAGE_REPORTING_REQUESTED,	/* zone enabled page reporting and has
-					 * requested flushing the data out of
-					 * higher order pages.
-					 */
 };
 
 static inline unsigned long zone_end_pfn(const struct zone *zone)
@@ -1300,7 +1267,6 @@ void sparse_init(void);
 #else
 #define sparse_init()	do {} while (0)
 #define sparse_index_init(_sec, _nid)  do {} while (0)
-#define pfn_present pfn_valid
 #endif /* CONFIG_SPARSEMEM */
 
 /*
