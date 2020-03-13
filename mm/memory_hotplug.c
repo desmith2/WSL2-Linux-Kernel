@@ -40,8 +40,6 @@
 #include <asm/tlbflush.h>
 
 #include "internal.h"
-#include "shuffle.h"
-#include "page_reporting.h"
 
 /*
  * online_page_callback contains pointer to current page onlining function.
@@ -941,8 +939,6 @@ int __ref online_pages(unsigned long pfn, unsigned long nr_pages, int online_typ
 	zone->zone_pgdat->node_present_pages += onlined_pages;
 	pgdat_resize_unlock(zone->zone_pgdat, &flags);
 
-	shuffle_zone(zone);
-
 	if (onlined_pages) {
 		node_states_set_node(nid, &arg);
 		if (need_zonelists_rebuild)
@@ -1710,7 +1706,6 @@ repeat:
 	if (!populated_zone(zone)) {
 		zone_pcp_reset(zone);
 		build_all_zonelists(NULL);
-		page_reporting_reset_zone(zone);
 	} else
 		zone_pcp_update(zone);
 

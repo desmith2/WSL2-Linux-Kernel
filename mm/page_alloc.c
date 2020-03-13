@@ -43,7 +43,6 @@
 #include <linux/mempolicy.h>
 #include <linux/memremap.h>
 #include <linux/stop_machine.h>
-#include <linux/random.h>
 #include <linux/sort.h>
 #include <linux/pfn.h>
 #include <linux/backing-dev.h>
@@ -72,8 +71,6 @@
 #include <asm/tlbflush.h>
 #include <asm/div64.h>
 #include "internal.h"
-#include "shuffle.h"
-#include "page_reporting.h"
 
 /* prevent >1 _updater_ of zone percpu pageset ->high and ->batch fields */
 static DEFINE_MUTEX(pcp_batch_high_lock);
@@ -728,6 +725,12 @@ static inline void set_page_order(struct page *page, unsigned int order)
 	__SetPageBuddy(page);
 }
 
+static inline void rmv_page_order(struct page *page)
+{
+	__ClearPageBuddy(page);
+	set_page_private(page, 0);
+}
+
 /*
  * This function checks whether a page is free && is the buddy
  * we can coalesce a page and its buddy if
@@ -769,87 +772,6 @@ static inline int page_is_buddy(struct page *page, struct page *buddy,
 	return 0;
 }
 
-/* Used for pages not on another list */
-static inline void add_to_free_list(struct page *page, struct zone *zone,
-				    unsigned int order, int migratetype)
-{
-	struct free_area *area = &zone->free_area[order];
-
-	list_add(&page->lru, &area->free_list[migratetype]);
-	area->nr_free++;
-}
-
-/* Used for pages not on another list */
-static inline void add_to_free_list_tail(struct page *page, struct zone *zone,
-					 unsigned int order, int migratetype)
-{
-	struct list_head *tail = get_unreported_tail(zone, order, migratetype);
-
-	/*
-	 * To prevent the unreported pages from slipping behind our iterator
-	 * we will force them to be inserted in front of it. By doing this
-	 * we should only need to make one pass through the freelist.
-	 */
-	list_add_tail(&page->lru, tail);
-	zone->free_area[order].nr_free++;
-}
-
-/* Used for pages which are on another list */
-static inline void move_to_free_list(struct page *page, struct zone *zone,
-				     unsigned int order, int migratetype)
-{
-	struct free_area *area = &zone->free_area[order];
-
-	/* Make certain the page isn't occupying the boundary */
-	if (unlikely(PageReported(page)))
-		__del_page_from_reported_list(page, zone);
-
-	list_move(&page->lru, &area->free_list[migratetype]);
-}
-
-static inline void del_page_from_free_list(struct page *page, struct zone *zone,
-					   unsigned int order)
-{
-	/* remove page from reported list, and clear reported state */
-	if (unlikely(PageReported(page)))
-		del_page_from_reported_list(page, zone, order);
-
-	list_del(&page->lru);
-	__ClearPageBuddy(page);
-	set_page_private(page, 0);
-	zone->free_area[order].nr_free--;
-}
-
-/*
- * If this is not the largest possible page, check if the buddy
- * of the next-highest order is free. If it is, it's possible
- * that pages are being freed that will coalesce soon. In case,
- * that is happening, add the free page to the tail of the list
- * so it's less likely to be used soon and more likely to be merged
- * as a higher order page
- */
-static inline bool
-buddy_merge_likely(unsigned long pfn, unsigned long buddy_pfn,
-		   struct page *page, unsigned int order)
-{
-	struct page *higher_page, *higher_buddy;
-	unsigned long combined_pfn;
-
-	if (order >= MAX_ORDER - 2)
-		return false;
-
-	if (!pfn_valid_within(buddy_pfn))
-		return false;
-
-	combined_pfn = buddy_pfn & pfn;
-	higher_page = page + (combined_pfn - pfn);
-	buddy_pfn = __find_buddy_pfn(combined_pfn, order + 1);
-	higher_buddy = higher_page + (buddy_pfn - combined_pfn);
-
-	return pfn_valid_within(buddy_pfn) &&
-	       page_is_buddy(higher_page, higher_buddy, order + 1);
-}
-
 /*
  * Freeing function for a buddy system allocator.
  *
@@ -877,13 +799,12 @@ buddy_merge_likely(unsigned long pfn, unsigned long buddy_pfn,
 static inline void __free_one_page(struct page *page,
 		unsigned long pfn,
 		struct zone *zone, unsigned int order,
-		int migratetype, bool reported)
+		int migratetype)
 {
-	unsigned long uninitialized_var(buddy_pfn);
 	unsigned long combined_pfn;
-	unsigned int max_order;
+	unsigned long uninitialized_var(buddy_pfn);
 	struct page *buddy;
-	bool to_tail;
+	unsigned int max_order;
 
 	max_order = min_t(unsigned int, MAX_ORDER, pageblock_order + 1);
 
@@ -910,10 +831,13 @@ continue_merging:
 		 * Our buddy is free or it is CONFIG_DEBUG_PAGEALLOC guard page,
 		 * merge with it and move up one order.
 		 */
-		if (page_is_guard(buddy))
+		if (page_is_guard(buddy)) {
 			clear_page_guard(zone, buddy, order, migratetype);
-		else
-			del_page_from_free_list(buddy, zone, order);
+		} else {
+			list_del(&buddy->lru);
+			zone->free_area[order].nr_free--;
+			rmv_page_order(buddy);
+		}
 		combined_pfn = buddy_pfn & pfn;
 		page = page + (combined_pfn - pfn);
 		pfn = combined_pfn;
@@ -947,25 +871,31 @@ continue_merging:
 done_merging:
 	set_page_order(page, order);
 
-	if (reported)
-		to_tail = true;
-	else if (is_shuffle_order(order))
-		to_tail = shuffle_pick_tail();
-	else
-		to_tail = buddy_merge_likely(pfn, buddy_pfn, page, order);
-
-	if (to_tail)
-		add_to_free_list_tail(page, zone, order, migratetype);
-	else
-		add_to_free_list(page, zone, order, migratetype);
-
 	/*
-	 * No need to notify on a reported page as the total count of
-	 * unreported pages will not have increased since we have essentially
-	 * merged the reported page with one or more unreported pages.
+	 * If this is not the largest possible page, check if the buddy
+	 * of the next-highest order is free. If it is, it's possible
+	 * that pages are being freed that will coalesce soon. In case,
+	 * that is happening, add the free page to the tail of the list
+	 * so it's less likely to be used soon and more likely to be merged
+	 * as a higher order page
 	 */
-	if (!reported)
-		page_reporting_notify_free(zone, order);
+	if ((order < MAX_ORDER-2) && pfn_valid_within(buddy_pfn)) {
+		struct page *higher_page, *higher_buddy;
+		combined_pfn = buddy_pfn & pfn;
+		higher_page = page + (combined_pfn - pfn);
+		buddy_pfn = __find_buddy_pfn(combined_pfn, order + 1);
+		higher_buddy = higher_page + (buddy_pfn - combined_pfn);
+		if (pfn_valid_within(buddy_pfn) &&
+		    page_is_buddy(higher_page, higher_buddy, order + 1)) {
+			list_add_tail(&page->lru,
+				&zone->free_area[order].free_list[migratetype]);
+			goto out;
+		}
+	}
+
+	list_add(&page->lru, &zone->free_area[order].free_list[migratetype]);
+out:
+	zone->free_area[order].nr_free++;
 }
 
 /*
@@ -1246,7 +1176,7 @@ static void free_pcppages_bulk(struct zone *zone, int count,
 		if (unlikely(isolated_pageblocks))
 			mt = get_pageblock_migratetype(page);
 
-		__free_one_page(page, page_to_pfn(page), zone, 0, mt, false);
+		__free_one_page(page, page_to_pfn(page), zone, 0, mt);
 		trace_mm_page_pcpu_drain(page, 0, mt);
 	}
 	spin_unlock(&zone->lock);
@@ -1262,7 +1192,7 @@ static void free_one_page(struct zone *zone,
 		is_migrate_isolate(migratetype))) {
 		migratetype = get_pfnblock_migratetype(page, pfn);
 	}
-	__free_one_page(page, pfn, zone, order, migratetype, false);
+	__free_one_page(page, pfn, zone, order, migratetype);
 	spin_unlock(&zone->lock);
 }
 
@@ -1799,9 +1729,9 @@ _deferred_grow_zone(struct zone *zone, unsigned int order)
 void __init page_alloc_init_late(void)
 {
 	struct zone *zone;
-	int nid;
 
 #ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
+	int nid;
 
 	/* There will be num_node_state(N_MEMORY) threads */
 	atomic_set(&pgdat_init_n_undone, num_node_state(N_MEMORY));
@@ -1833,9 +1763,6 @@ void __init page_alloc_init_late(void)
 	/* Discard memblock private memory */
 	memblock_discard();
 #endif
-
-	for_each_node_state(nid, N_MEMORY)
-		shuffle_free_memory(NODE_DATA(nid));
 
 	for_each_populated_zone(zone)
 		set_zone_contiguous(zone);
@@ -1887,11 +1814,13 @@ void __init init_cma_reserved_pageblock(struct page *page)
  * -- nyc
  */
 static inline void expand(struct zone *zone, struct page *page,
-	int low, int high, int migratetype)
+	int low, int high, struct free_area *area,
+	int migratetype)
 {
 	unsigned long size = 1 << high;
 
 	while (high > low) {
+		area--;
 		high--;
 		size >>= 1;
 		VM_BUG_ON_PAGE(bad_range(zone, &page[size]), &page[size]);
@@ -1905,7 +1834,8 @@ static inline void expand(struct zone *zone, struct page *page,
 		if (set_page_guard(zone, &page[size], high, migratetype))
 			continue;
 
-		add_to_free_list(&page[size], zone, high, migratetype);
+		list_add(&page[size].lru, &area->free_list[migratetype]);
+		area->nr_free++;
 		set_page_order(&page[size], high);
 	}
 }
@@ -2046,11 +1976,14 @@ struct page *__rmqueue_smallest(struct zone *zone, unsigned int order,
 	/* Find a page of the appropriate size in the preferred list */
 	for (current_order = order; current_order < MAX_ORDER; ++current_order) {
 		area = &(zone->free_area[current_order]);
-		page = get_page_from_free_area(area, migratetype);
+		page = list_first_entry_or_null(&area->free_list[migratetype],
+							struct page, lru);
 		if (!page)
 			continue;
-		del_page_from_free_list(page, zone, current_order);
-		expand(zone, page, order, current_order, migratetype);
+		list_del(&page->lru);
+		rmv_page_order(page);
+		area->nr_free--;
+		expand(zone, page, order, current_order, area, migratetype);
 		set_pcppage_migratetype(page, migratetype);
 		return page;
 	}
@@ -2058,40 +1991,6 @@ struct page *__rmqueue_smallest(struct zone *zone, unsigned int order,
 	return NULL;
 }
 
-#ifdef CONFIG_PAGE_REPORTING
-/**
- * free_reported_page - Return a now-reported page back where we got it
- * @page: Page that was reported
- * @order: Order of the reported page
- *
- * This function will pull the migratetype and order information out
- * of the page and attempt to return it where it found it. If the page
- * is added to the free list without changes we will mark it as being
- * reported.
- */
-void free_reported_page(struct page *page, unsigned int order)
-{
-	struct zone *zone = page_zone(page);
-	unsigned long pfn;
-	unsigned int mt;
-
-	/* zone lock should be held when this function is called */
-	lockdep_assert_held(&zone->lock);
-
-	pfn = page_to_pfn(page);
-	mt = get_pfnblock_migratetype(page, pfn);
-	__free_one_page(page, pfn, zone, order, mt, true);
-
-	/*
-	 * If page was not comingled with another page we can consider
-	 * the result to be "reported" since part of the page hasn't been
-	 * modified, otherwise we would need to report on the new larger
-	 * page.
-	 */
-	if (PageBuddy(page) && page_order(page) == order)
-		add_page_to_reported_list(page, zone, order, mt);
-}
-#endif /* CONFIG_PAGE_REPORTING */
 
 /*
  * This array describes the order lists are fallen back to when
@@ -2173,7 +2072,8 @@ static int move_freepages(struct zone *zone,
 		}
 
 		order = page_order(page);
-		move_to_free_list(page, zone, order, migratetype);
+		list_move(&page->lru,
+			  &zone->free_area[order].free_list[migratetype]);
 		page += 1 << order;
 		pages_moved += 1 << order;
 	}
@@ -2259,6 +2159,7 @@ static void steal_suitable_fallback(struct zone *zone, struct page *page,
 					int start_type, bool whole_block)
 {
 	unsigned int current_order = page_order(page);
+	struct free_area *area;
 	int free_pages, movable_pages, alike_pages;
 	int old_block_type;
 
@@ -2320,7 +2221,8 @@ static void steal_suitable_fallback(struct zone *zone, struct page *page,
 	return;
 
 single_page:
-	move_to_free_list(page, zone, current_order, start_type);
+	area = &zone->free_area[current_order];
+	list_move(&page->lru, &area->free_list[start_type]);
 }
 
 /*
@@ -2344,7 +2246,7 @@ int find_suitable_fallback(struct free_area *area, unsigned int order,
 		if (fallback_mt == MIGRATE_TYPES)
 			break;
 
-		if (free_area_empty(area, fallback_mt))
+		if (list_empty(&area->free_list[fallback_mt]))
 			continue;
 
 		if (can_steal_fallback(order, migratetype))
@@ -2431,7 +2333,9 @@ static bool unreserve_highatomic_pageblock(const struct alloc_context *ac,
 		for (order = 0; order < MAX_ORDER; order++) {
 			struct free_area *area = &(zone->free_area[order]);
 
-			page = get_page_from_free_area(area, MIGRATE_HIGHATOMIC);
+			page = list_first_entry_or_null(
+					&area->free_list[MIGRATE_HIGHATOMIC],
+					struct page, lru);
 			if (!page)
 				continue;
 
@@ -2544,7 +2448,8 @@ find_smallest:
 	VM_BUG_ON(current_order == MAX_ORDER);
 
 do_steal:
-	page = get_page_from_free_area(area, fallback_mt);
+	page = list_first_entry(&area->free_list[fallback_mt],
+							struct page, lru);
 
 	steal_suitable_fallback(zone, page, start_migratetype, can_steal);
 
@@ -2995,8 +2900,9 @@ int __isolate_free_page(struct page *page, unsigned int order)
 	}
 
 	/* Remove page from free list */
-
-	del_page_from_free_list(page, zone, order);
+	list_del(&page->lru);
+	zone->free_area[order].nr_free--;
+	rmv_page_order(page);
 
 	/*
 	 * Set the pageblock if the isolated page is at least half of a
@@ -3290,13 +3196,13 @@ bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
 			continue;
 
 		for (mt = 0; mt < MIGRATE_PCPTYPES; mt++) {
-			if (!free_area_empty(area, mt))
+			if (!list_empty(&area->free_list[mt]))
 				return true;
 		}
 
 #ifdef CONFIG_CMA
 		if ((alloc_flags & ALLOC_CMA) &&
-		    !free_area_empty(area, MIGRATE_CMA)) {
+		    !list_empty(&area->free_list[MIGRATE_CMA])) {
 			return true;
 		}
 #endif
@@ -5140,7 +5046,7 @@ void show_free_areas(unsigned int filter, nodemask_t *nodemask)
 
 			types[order] = 0;
 			for (type = 0; type < MIGRATE_TYPES; type++) {
-				if (!free_area_empty(area, type))
+				if (!list_empty(&area->free_list[type]))
 					types[order] |= 1 << type;
 			}
 		}
@@ -8192,7 +8098,9 @@ __offline_isolated_pages(unsigned long start_pfn, unsigned long end_pfn)
 		pr_info("remove from free list %lx %d %lx\n",
 			pfn, 1 << order, end_pfn);
 #endif
-		del_page_from_free_list(page, zone, order);
+		list_del(&page->lru);
+		rmv_page_order(page);
+		zone->free_area[order].nr_free--;
 		for (i = 0; i < (1 << order); i++)
 			SetPageReserved((page+i));
 		pfn += (1 << order);
