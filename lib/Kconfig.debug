@@ -412,6 +412,7 @@ config MAGIC_SYSRQ
 	  keys are documented in <file:Documentation/admin-guide/sysrq.rst>.
 	  Don't say Y unless you really know what this hack does.
 
+
 config MAGIC_SYSRQ_DEFAULT_ENABLE
 	hex "Enable magic SysRq key functions by default"
 	depends on MAGIC_SYSRQ
@@ -430,6 +431,8 @@ config MAGIC_SYSRQ_SERIAL
 	  generate some garbage that can lead to spurious false sysrq detects.
 	  This option allows you to decide whether you want to enable the
 	  magic SysRq key.
+
+source "kernel/ipipe/Kconfig.debug"
 
 config DEBUG_KERNEL
 	bool "Kernel debugging"
@@ -978,8 +981,8 @@ config PANIC_TIMEOUT
 
 config SCHED_DEBUG
 	bool "Collect scheduler debugging info"
-	depends on PROC_FS
-	default n
+	depends on DEBUG_KERNEL && PROC_FS
+	default y
 	help
 	  If you say Y here, the /proc/sched_debug file will be provided
 	  that can help debug the scheduler. The runtime overhead of this
@@ -991,7 +994,7 @@ config SCHED_INFO
 
 config SCHEDSTATS
 	bool "Collect scheduler statistics"
-	depends on PROC_FS
+	depends on DEBUG_KERNEL && PROC_FS
 	select SCHED_INFO
 	help
 	  If you say Y here, additional code will be inserted into the
@@ -1004,6 +1007,7 @@ config SCHEDSTATS
 
 config SCHED_STACK_END_CHECK
 	bool "Detect stack corruption on calls to schedule()"
+	depends on DEBUG_KERNEL
 	default n
 	help
 	  This option checks for a stack overrun on calls to schedule().
