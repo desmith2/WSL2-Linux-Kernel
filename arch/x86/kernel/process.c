@@ -687,13 +687,17 @@ static __cpuidle void mwait_idle(void)
 		}
 
 		__monitor((void *)&current_thread_info()->flags, 0, 0);
-		if (!need_resched())
-#ifdef CONFIG_IPIPE
-			__ipipe_halt_root(1);
+		if (!need_resched()) {
+		
+#if defined(CONFIG_IPIPE)
+		
+		void __ipipe_halt_root(int use_mwait);
+			
+		__ipipe_halt_root(1);
 #else
-			__sti_mwait(0, 0);
+		__sti_mwait(0, 0);
 #endif
-		else
+		} else
 			local_irq_enable();
 		trace_cpu_idle_rcuidle(PWR_EVENT_EXIT, smp_processor_id());
 	} else {
